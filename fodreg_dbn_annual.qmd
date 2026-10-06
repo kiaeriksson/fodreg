@@ -1,0 +1,339 @@
+---
+title: "fodreg: DAG networks of Gulf of Bothnia basins (annual data)"
+subtitle: "Dynamic Bayesian networks with dbnR – drivers of primary and bacterial production"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: true
+    code-tools: true
+    embed-resources: true
+    fig-width: 8
+    fig-height: 6
+execute:
+  warning: false
+  message: false
+params:
+  data_file: "AnnualBasinDataGOB94t23.xlsx"
+  size: 2          # number of time slices: 2 = t_0 and t_1 (one step back = 1 year here)
+  intra: true      # allow arcs within the same time slice (same-year effects)
+  detrend: false   # remove linear trend (by year) per variable and basin before learning
+  n_boot: 200      # bootstrap replicates for arc-strength section
+  threshold: 0.5   # arc-strength threshold for the averaged network
+---
+
+# Aim
+
+Infer which environmental variables (and zooplankton) lead to the two response variables
+
+- **Phytoplankton production** (`PhytProd`)
+- **Bacterioplankton production** (`BaGroBm`, biomass production; swap to `BaGroCel` for cell growth if preferred)
+
+using a dynamic Bayesian network (DBN) in the R package **dbnR**, with one network per basin:
+Bothnian Bay, Bothnian Sea and the Öre estuary. This first version uses the **annual** values
+(1994–2023). The code is written so the same functions can be re-used on seasonal data later (see the last section).
+
+# Setup
+
+```{r setup}
+library(readxl)
+library(data.table)
+library(dplyr)
+library(ggplot2)
+library(bnlearn)
+library(dbnR)
+library(visNetwork)
+
+set.seed(42)
+```
+
+## Choices
+
+```{r choices}
+# Basin codes in the file are A, B and C. The metadata sheet does not say which is which.
+# Mapping below is an ASSUMPTION based on the salinity gradient (A ~3, B ~4, C ~5 PSU)
+# -> CHECK WITH THE MAIN AUTHOR.
+basin_map <- c(A = "Bothnian Bay", B = "Bothnian Sea", C = "Oere estuary")
+
+# Responses
+responses <- c(PhytProd = "Phytoplankton production",
+               BaGroBm  = "Bacterial biomass production")
+
+# Prioritised predictors (PLS selection by co-author)
+predictors <- c(TotP     = "Total phosphorus",
+                PO4      = "Phosphate",
+                Cladocer = "Cladocerans",
+                Copepoda = "Copepoda",
+                Salinity = "Salinity",
+                SiO4     = "Silicate",
+                GlobIrra = "Global irradiation",
+                DOC      = "DOC",
+                TotN     = "Total nitrogen")
+
+vars <- c(names(responses), names(predictors))
+labels <- c(responses, predictors)
+```
+
+# Data
+
+```{r data}
+raw <- read_excel(params$data_file, sheet = 1,
+                  na = c("", "NA", "#NULL!")) |>
+  as.data.table()
+
+dat <- raw[, c("Seabasin", "Year", vars), with = FALSE]
+dat[, Basin := basin_map[Seabasin]]
+setorder(dat, Basin, Year)
+
+# Missing values per variable and basin
+miss <- dat[, lapply(.SD, function(x) sum(is.na(x))), by = Basin, .SDcols = vars]
+knitr::kable(miss, caption = "Number of missing years per variable and basin")
+```
+
+Years with missing values (these only remove the time-step pairs that involve them, see below):
+
+```{r missing-years}
+dat[, .(years_with_NA = paste(Year[!complete.cases(.SD)], collapse = ", ")),
+    by = Basin, .SDcols = vars] |>
+  knitr::kable()
+```
+
+## Overview of the time series
+
+```{r ts-plot}
+#| fig-height: 9
+long <- melt(dat, id.vars = c("Basin", "Year"), measure.vars = vars,
+             variable.name = "var", value.name = "value")
+long[, var_label := factor(labels[as.character(var)], levels = labels)]
+
+ggplot(long, aes(Year, value, colour = Basin)) +
+  geom_line(na.rm = TRUE) +
+  facet_wrap(~var_label, scales = "free_y", ncol = 3) +
+  theme_bw() + theme(legend.position = "bottom")
+```
+
+# Preprocessing
+
+For each basin separately:
+
+1. optionally remove a linear trend (`params$detrend`),
+2. standardise every variable to mean 0 and SD 1 (z-score, within basin),
+3. fold the series into time slices (`t_0` = current year, `t_1` = previous year) with `dbnR::fold_dt()`,
+4. drop rows of the folded table that contain `NA`.
+
+Folding is done on the *complete* year sequence (with `NA`s kept in place) so that lags are never
+formed across a gap; only the affected pairs are dropped afterwards.
+
+```{r preprocess}
+prep_basin <- function(d, vars, size = 2, detrend = FALSE) {
+  d <- copy(d)
+  setorder(d, Year)
+  stopifnot(all(diff(d$Year) == 1))   # consecutive time steps required for lags
+
+  x <- as.data.table(d[, ..vars])
+
+  if (detrend) {
+    x <- x[, lapply(.SD, function(v) as.numeric(resid(lm(v ~ d$Year, na.action = na.exclude))))]
+  }
+
+  # z-score within basin (NA-safe)
+  x <- x[, lapply(.SD, function(v) as.numeric(scale(v)))]
+
+  f <- dbnR::fold_dt(x, size = size)
+  f <- na.omit(f)
+  list(z = x, folded = f)
+}
+
+basins <- unname(basin_map)
+prep <- lapply(setNames(basins, basins), function(b) {
+  prep_basin(dat[Basin == b], vars, size = params$size, detrend = params$detrend)
+})
+
+data.frame(Basin = basins,
+           n_years = sapply(basins, function(b) nrow(dat[Basin == b])),
+           n_rows_used = sapply(prep, function(p) nrow(p$folded)),
+           n_nodes = sapply(prep, function(p) ncol(p$folded)),
+           row.names = NULL) |>
+  knitr::kable(caption = "Rows available for structure learning after folding")
+```
+
+::: {.callout-warning}
+## Small sample size
+With roughly 24–29 usable rows and 22 nodes (11 variables × 2 time slices), the learned structure will be
+unstable and sparse. Treat single arcs with caution and use the bootstrap section below to see which arcs are
+robust. Annual series with trends (salinity, DOC/browning, irradiation) can also create apparent links
+between variables that simply share a trend. Compare `detrend: true` against `false`.
+:::
+
+# Structure learning with dbnR
+
+`learn_dbn_struc()` uses the dynamic max–min hill-climbing algorithm (`dmmhc`) by default. Arcs can only go
+from `t_1` to `t_0`; with `intra: true` arcs within `t_0` (same-year effects) are allowed as well.
+With annual data, same-year effects are probably the most interesting ones, whereas the lag-1 arcs often
+mainly capture autocorrelation.
+
+```{r learn}
+learn_net <- function(folded, size, intra) {
+  dbnR::learn_dbn_struc(dt = NULL, size = size, method = "dmmhc",
+                        f_dt = folded, intra = intra)
+}
+
+nets <- lapply(prep, function(p) learn_net(p$folded, params$size, params$intra))
+```
+
+```{r helpers}
+# Parents of a node (arcs pointing into it)
+arcs_into <- function(net, targets) {
+  a <- as.data.frame(bnlearn::arcs(net))
+  if (nrow(a) == 0) return(a)
+  a[a$to %in% targets, , drop = FALSE]
+}
+
+target_nodes <- paste0(names(responses), "_t_0")
+
+plot_net <- function(net, title) {
+  nodes <- data.frame(id = bnlearn::nodes(net), stringsAsFactors = FALSE)
+  base <- sub("_t_[0-9]+$", "", nodes$id)
+  slice <- sub("^.*_t_", "t_", nodes$id)
+  nodes$label <- paste0(base, " (", slice, ")")
+  nodes$group <- ifelse(nodes$id %in% target_nodes, "Response",
+                        ifelse(slice == "t_0", "Predictor t_0", "Predictor t_1"))
+  a <- as.data.frame(bnlearn::arcs(net))
+  edges <- if (nrow(a)) data.frame(from = a$from, to = a$to, arrows = "to") else NULL
+
+  visNetwork(nodes, edges, main = title, height = "600px", width = "100%") |>
+    visGroups(groupname = "Response",      color = "#d95f02", shape = "box") |>
+    visGroups(groupname = "Predictor t_0", color = "#1b9e77") |>
+    visGroups(groupname = "Predictor t_1", color = "#7570b3") |>
+    visLegend() |>
+    visOptions(highlightNearest = list(enabled = TRUE, degree = 1)) |>
+    visPhysics(stabilization = TRUE)
+}
+```
+
+## Bothnian Bay
+
+```{r net-bay}
+plot_net(nets[["Bothnian Bay"]], "Bothnian Bay")
+```
+
+```{r arcs-bay}
+knitr::kable(arcs_into(nets[["Bothnian Bay"]], target_nodes), row.names = FALSE,
+             caption = "Arcs into the response nodes, Bothnian Bay")
+```
+
+## Bothnian Sea
+
+```{r net-sea}
+plot_net(nets[["Bothnian Sea"]], "Bothnian Sea")
+```
+
+```{r arcs-sea}
+knitr::kable(arcs_into(nets[["Bothnian Sea"]], target_nodes), row.names = FALSE,
+             caption = "Arcs into the response nodes, Bothnian Sea")
+```
+
+## Öre estuary
+
+```{r net-ore}
+plot_net(nets[["Oere estuary"]], "Öre estuary")
+```
+
+```{r arcs-ore}
+knitr::kable(arcs_into(nets[["Oere estuary"]], target_nodes), row.names = FALSE,
+             caption = "Arcs into the response nodes, Öre estuary")
+```
+
+## Fitted parameters (linear Gaussian)
+
+Coefficients are in standardised units, so they are comparable between predictors within a basin.
+
+```{r fit}
+fits <- Map(function(net, p) {
+  tryCatch(dbnR::fit_dbn_params(net, p$folded, method = "mle-g"),
+           error = function(e) NULL)
+}, nets, prep)
+
+for (b in basins) {
+  cat("\n###", b, "\n")
+  fit <- fits[[b]]
+  if (is.null(fit)) { cat("Parameter fitting failed.\n"); next }
+  for (tn in target_nodes) {
+    cf <- fit[[tn]]$coefficients
+    cat("\n**", tn, "**\n\n")
+    print(round(cf, 3))
+  }
+}
+```
+
+# Robustness: bootstrapped arc strength
+
+A single hill-climbing run on ~25 observations is fragile. Here the same time-slice restrictions are imposed
+as a blacklist in `bnlearn`, the structure is learned on bootstrap resamples, and the arcs are summarised by
+how often they appear (`strength`) and how consistent their direction is (`direction`). This is not
+`dbnR` itself but works on the same folded data.
+
+```{r boot}
+make_blacklist <- function(nodes, intra) {
+  slice <- as.integer(sub("^.*_t_", "", nodes))
+  bl <- expand.grid(from = nodes, to = nodes, stringsAsFactors = FALSE)
+  s_from <- as.integer(sub("^.*_t_", "", bl$from))
+  s_to   <- as.integer(sub("^.*_t_", "", bl$to))
+  # nothing can be caused by the present or later than the effect: only older -> newer
+  forbid <- s_from < s_to                       # t_0 -> t_1 (future causing past)
+  forbid <- forbid | (s_from == s_to & s_to > 0) # no arcs within the past slice(s)
+  if (!intra) forbid <- forbid | (s_from == 0 & s_to == 0)
+  bl <- bl[forbid | bl$from == bl$to, ]
+  bl
+}
+
+boot_one <- function(folded, intra, R, threshold) {
+  df <- as.data.frame(folded)
+  bl <- make_blacklist(names(df), intra)
+  st <- boot.strength(df, R = R, algorithm = "hc",
+                      algorithm.args = list(score = "bic-g", blacklist = bl))
+  list(strength = st,
+       avg = averaged.network(st, threshold = threshold))
+}
+
+boots <- lapply(prep, function(p) boot_one(p$folded, params$intra, params$n_boot, params$threshold))
+```
+
+```{r boot-tables}
+for (b in basins) {
+  st <- boots[[b]]$strength
+  st <- st[st$to %in% target_nodes & st$strength >= 0.3 & st$direction >= 0.5, ]
+  st <- st[order(st$to, -st$strength), ]
+  cat("\n###", b, "\n\n")
+  print(knitr::kable(st, row.names = FALSE, digits = 2,
+                     caption = paste("Arcs into response nodes with strength >= 0.3 -", b)))
+}
+```
+
+```{r boot-plots}
+#| results: asis
+for (b in basins) {
+  cat("\n### Averaged network, ", b, " (threshold ", params$threshold, ")\n\n", sep = "")
+  print(htmltools::tagList(plot_net(boots[[b]]$avg, paste(b, "- bootstrap-averaged"))))
+}
+```
+
+# Extending to seasonal data
+
+The functions above only assume a table with one row per consecutive time step. For seasonal data:
+
+- Replace the `Year` column by a running time index (e.g. year + season; all seasons present, with `NA` in gaps) and
+  make sure `diff()` of the index is constant, so that `t_1` always means "one season back".
+- Standardise **within season** (or remove the seasonal cycle) *and* within basin, otherwise the seasonal cycle itself will
+  dominate the correlations. Alternatively keep the seasonal cycle and add a season term (e.g. `sin`/`cos` of day of year) as an
+  exogenous node that is only allowed to point to other nodes (use a whitelist/blacklist).
+- Light, temperature and the productivity variables lag each other by weeks to months; consider `size = 3`
+  or the number of seasons per year as a way of covering one year back.
+- Keep in mind that the number of rows grows by roughly the number of seasons per year, which helps the
+  stability problem considerably.
+
+# Session info
+
+```{r session}
+sessionInfo()
+```
